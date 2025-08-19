@@ -1,82 +1,138 @@
-from __future__ import annotations
 import argparse
+import asyncio
+import datetime as dt
+import ipaddress
+import json
 import os
 import sys
 from typing import List
 
-from .scanner import scan
-from .report import write_reports
-from .utils import (
-    parse_ports, is_private_network, exit_error, ensure_dir
+from .netutils import (
+    autodetect_private_cidr,
+    count_hosts,
+    describe_networks,
+    is_private_networks,
+    parse_cidrs,
+    parse_ports,
 )
+from .report import write_reports
+from .scanner import scan_networks
+from . import __version__
 
-def build_parser() -> argparse.ArgumentParser:
+DEFAULT_PORTS = "22,80,443,445,139,3389,53,3306,5432,8080,8000,8443"
+
+def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="lan-audit",
-        description="Non-intrusive LAN discovery + TCP port scan (Windows + Android/Termux)."
+        description="Non-intrusive LAN discovery + basic port scan + banner grab; JSON/HTML report.",
     )
-    p.add_argument("target", help="IP/CIDR, e.g., 192.168.1.0/24 or 192.168.1.10")
-    p.add_argument("--ports", help="Comma list or ranges (e.g., 22,80,443 or 1-1024). Default: common set.")
-    p.add_argument("--workers", type=int, default=120, help="Max concurrent threads (default: 120)")
-    p.add_argument("--ping-timeout", type=int, default=1000, help="Ping timeout ms (default: 1000)")
-    p.add_argument("--tcp-timeout", type=float, default=0.6, help="TCP connect/banner timeout seconds (default: 0.6)")
-    p.add_argument("--skip-ping", action="store_true", help="Skip ping reachability test (scan all hosts)")
-    p.add_argument("--format", choices=["json","html","both"], default="json", help="Report format")
-    p.add_argument("--output", default=None, help="Output directory (default: ./reports/<timestamp>)")
-    p.add_argument("--allow-public", action="store_true",
-                   help="Allow scanning non-private ranges (use only with permission)")
-    p.add_argument("--consent", metavar="YES", required=True,
-                   help='Type YES to affirm you have authorization to scan the target')
-    return p
+    p.add_argument("--consent", required=True, help="Must be 'YES' to run scans")
+    p.add_argument("--cidr", help="CIDRs to scan (comma/space separated). If absent, autodetect local private network.")
+    p.add_argument("--ports", default=DEFAULT_PORTS, help=f"Port list/ranges. Default: {DEFAULT_PORTS}")
+    p.add_argument("--concurrency", type=int, default=512, help="Global concurrency (default: 512)")
+    p.add_argument("--timeout", type=float, default=1.0, help="Connect timeout seconds (default: 1.0)")
+    p.add_argument("--read-timeout", type=float, default=0.8, help="Banner read timeout seconds (default: 0.8)")
+    p.add_argument("--resolve-hostnames", action="store_true", help="Try reverse DNS for hosts")
+    p.add_argument("--output-dir", default="reports", help="Output directory (default: reports)")
+    p.add_argument("--allow-public", action="store_true", help="Allow scanning non-private CIDRs")
+    p.add_argument("--max-hosts", type=int, default=4096, help="Safety cap on total hosts (default: 4096)")
+    return p.parse_args()
 
 def main():
-    parser = build_parser()
-    args = parser.parse_args()
+    args = parse_args()
 
-    if args.consent.strip().upper() != "YES":
-        exit_error("Consent not affirmed (use --consent YES).")
+    # Safety gate: explicit consent
+    if args.consent != "YES":
+        print("[!] Consent required. Run with: --consent YES", file=sys.stderr)
+        sys.exit(2)
 
-    if not args.allow_public and not is_private_network(args.target):
-        exit_error("Target is not a private RFC1918 network. Add --allow-public if you are authorized.")
-
+    # Ports
     ports = parse_ports(args.ports)
     if not ports:
-        exit_error("No valid ports were parsed from --ports.")
+        print("[!] No valid ports parsed.", file=sys.stderr)
+        sys.exit(2)
 
-    # Output dir
-    out_dir = args.output
-    if not out_dir:
-        from datetime import datetime
-        stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-        out_dir = os.path.join(os.getcwd(), "reports", stamp)
-    ensure_dir(out_dir)
+    # CIDRs
+    nets: List[ipaddress.IPv4Network] = []
+    if args.cidr:
+        nets = parse_cidrs(args.cidr)
+        if not nets:
+            print("[!] No valid CIDR(s) parsed.", file=sys.stderr)
+            sys.exit(2)
+    else:
+        net = autodetect_private_cidr()
+        if not net:
+            print("[!] Could not autodetect a local private IPv4 network. Specify --cidr.", file=sys.stderr)
+            sys.exit(2)
+        nets = [net]
 
-    print(f"[*] Target: {args.target}")
-    print(f"[*] Ports: {len(ports)} ports")
-    print(f"[*] Workers: {args.workers}")
-    print(f"[*] Output: {out_dir}")
-    print("[*] Scanning...")
+    # Safety: private-only unless --allow-public
+    if not is_private_networks(nets) and not args.allow_public:
+        print("[!] Refusing to scan non-private networks without --allow-public.", file=sys.stderr)
+        sys.exit(2)
 
-    hosts = scan(
-        target=args.target,
-        ports=ports,
-        workers=max(1, int(args.workers)),
-        ping_timeout_ms=max(100, int(args.ping_timeout)),
-        tcp_timeout=max(0.1, float(args.tcp_timeout)),
-        skip_ping=bool(args.skip_ping),
+    total_hosts = count_hosts(nets)
+    if total_hosts > args.max_hosts:
+        print(f"[!] Host count {total_hosts} exceeds --max-hosts {args.max_hosts}. "
+              f"Use a narrower CIDR or raise --max-hosts.", file=sys.stderr)
+        sys.exit(2)
+
+    nets_desc = ", ".join(n for n, _ in describe_networks(nets))
+    print(f"[*] lan-audit v{__version__}")
+    print(f"[*] Networks    : {nets_desc}")
+    print(f"[*] Ports       : {','.join(map(str, ports))}")
+    print(f"[*] Hosts       : {total_hosts}")
+    print(f"[*] Concurrency : {args.concurrency}")
+    print(f"[*] Timeouts    : connect={args.timeout}s, read={args.read_timeout}s")
+    print(f"[*] ReverseDNS  : {'ON' if args.resolve_hostnames else 'OFF'}")
+    print(f"[*] Output Dir  : {args.output_dir}")
+
+    started = dt.datetime.now()
+
+    # Run scan
+    scan_out = asyncio.run(
+        scan_networks(
+            nets=nets,
+            ports=ports,
+            concurrency=args.concurrency,
+            connect_timeout=args.timeout,
+            read_timeout=args.read_timeout,
+            resolve_hostnames=args.resolve_hostnames,
+        )
     )
 
-    paths = write_reports(
-        target=args.target,
-        hosts=hosts,
-        out_dir=out_dir,
-        workers=args.workers,
-        ports_used=ports,
-        formats=args.format
-    )
-    print("[+] Done.")
-    for k, v in paths.items():
-        print(f"[+] {k.upper()} report: {v}")
+    ended = dt.datetime.now()
+    duration = (ended - started).total_seconds()
+
+    # Build JSON payload
+    payload = {
+        "metadata": {
+            "start_time": started.isoformat(timespec="seconds"),
+            "end_time": ended.isoformat(timespec="seconds"),
+            "duration_s": round(duration, 3),
+            "args": {
+                "ports": ports,
+                "concurrency": args.concurrency,
+                "timeout": args.timeout,
+                "read_timeout": args.read_timeout,
+                "resolve_hostnames": bool(args.resolve_hostnames),
+                "allow_public": bool(args.allow_public),
+                "max_hosts": args.max_hosts,
+            },
+            "networks": [str(n) for n in nets],
+            "tool": f"lan-audit v{__version__}",
+            "consent": "YES",
+        },
+        "hosts": scan_out["hosts"],
+        "summary": scan_out["summary"],
+    }
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    paths = write_reports(args.output_dir, payload)
+
+    print(f"[*] JSON  : {paths['json']}")
+    print(f"[*] HTML  : {paths['html']}")
+    print("[*] Done.")
 
 if __name__ == "__main__":
     main()
