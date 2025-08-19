@@ -1,28 +1,60 @@
-# LAN Audit (Cross-Platform)
+🚀 LAN Audit
 
-Simple, non-intrusive LAN discovery + port scan + banner grab with JSON/HTML report.
-Works on **Windows** and **Android (Termux)** without admin/root.
 
-## Features
-- CIDR/host scan (e.g., `192.168.1.0/24` or `192.168.1.10`)
-- ICMP reachability via system `ping` (no raw sockets)
-- TCP connect scan (default common ports, or custom list)
-- Lightweight banner grab on open ports (HTTP HEAD for web ports)
-- TTL-based coarse OS guess (from `ping` output)
-- JSON + HTML reports
-- Safety gates: `--consent YES`, block public ranges unless `--allow-public`
 
-## Install
+✨ Features
 
-### Windows
-1. Install Python 3.10+ from python.org (add to PATH).
-2. Clone or download this repo.
-3. (Optional) `python -m venv .venv && .venv\Scripts\activate`
-4. `pip install -r requirements.txt`
+⚡ Live host discovery (TCP connect heuristic — no raw sockets)
 
-### Android (Termux)
-```sh
-pkg update && pkg upgrade -y
-pkg install python git -y
-git clone <your-repo-url>.git && cd lan-audit
+🔎 Basic port scan
+
+🏷️ Lightweight banner grab (HTTP/HTTPS HEAD, SSH/FTP/SMTP read)
+
+📊 JSON + HTML report (self-contained, no external deps)
+
+🛡️ Safety Gates
+
+✅ Must pass --consent YES
+
+🔒 Default: scan only private RFC1918 ranges
+
+🌍 To scan non-private CIDRs, pass --allow-public
+
+🚧 Safety cap: --max-hosts (default: 4096)
+
+⚙️ Quick Start
+🖥️ Windows (PowerShell)
+git clone https://github.com/maydulsec/lan-audit.git
+cd lan-audit
+python -m venv venv
+.\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+
+# Run (auto-detect private LAN)
+python -m lan_audit.cli --consent YES --resolve-hostnames
+
+# Or scan a specific subnet:
+# python -m lan_audit.cli --consent YES --cidr 192.168.1.0/24
+
+📱 Android (Termux)
+pkg install python git -y
+git clone https://github.com/maydulsec/lan-audit.git
+cd lan-audit
+python -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt || true   # psutil optional; fallback works
+
+# Run
+python -m lan_audit.cli --consent YES --resolve-hostnames
+
+⚡ Common Options
+--ports "22,80,443,1-1024"     # custom ports/ranges
+--cidr "192.168.1.0/24"        # one or more CIDRs (comma/space separated)
+--concurrency 512              # global async concurrency
+--timeout 1.0                  # TCP connect timeout
+--read-timeout 0.8             # banner read timeout
+--resolve-hostnames            # try reverse DNS
+--allow-public                 # allow non-private networks
+--max-hosts 4096               # safety cap
+--output-dir reports           # output folder
