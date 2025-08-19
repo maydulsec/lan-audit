@@ -1,162 +1,162 @@
-from __future__ import annotations
+import asyncio
 import ipaddress
 import socket
 import ssl
-import subprocess
-import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-from .utils import (
-    COMMON_PORTS, SERVICE_MAP, extract_ttl, os_guess_from_ttl, is_windows
-)
+SERVICE_GUESSES = {
+    21: "ftp",
+    22: "ssh",
+    23: "telnet",
+    25: "smtp",
+    53: "dns",
+    80: "http",
+    110: "pop3",
+    139: "netbios-ssn",
+    143: "imap",
+    443: "https",
+    445: "smb",
+    3306: "mysql",
+    3389: "rdp",
+    5432: "postgresql",
+    6379: "redis",
+    8000: "http-alt",
+    8080: "http-alt",
+    8443: "https-alt",
+}
 
-@dataclass
-class PortResult:
-    port: int
-    state: str  # "open" or "closed"
-    service_guess: str
-    banner: Optional[str] = None
+HTTP_PORTS = {80, 8080, 8000}
+HTTPS_PORTS = {443, 8443}
 
-@dataclass
-class HostResult:
-    ip: str
-    alive: bool
-    ttl: Optional[int]
-    os_guess: str
-    ports: List[PortResult]
-
-def iter_hosts(target: str) -> List[str]:
-    if "/" in target:
-        net = ipaddress.ip_network(target, strict=False)
-        return [str(h) for h in net.hosts()]
-    # single IP
-    ipaddress.ip_address(target)  # validate
-    return [target]
-
-def ping_host(ip: str, timeout_ms: int = 1000) -> Tuple[bool, Optional[int]]:
-    """ICMP reachability via system ping; returns (alive, ttl)."""
-    if is_windows():
-        cmd = ["ping", "-n", "1", "-w", str(timeout_ms), ip]
-    else:
-        # Busybox/iputils (Android/Termux): -c count, -W timeout (seconds)
-        secs = max(1, int(round(timeout_ms/1000)))
-        cmd = ["ping", "-c", "1", "-W", str(secs), ip]
+async def _reverse_dns(ip: str, timeout: float = 0.5) -> Optional[str]:
     try:
-        cp = subprocess.run(cmd, capture_output=True, text=True)
-        out = (cp.stdout or "") + "\n" + (cp.stderr or "")
-        ttl = extract_ttl(out)
-        alive = (cp.returncode == 0) or (ttl is not None)
-        return alive, ttl
-    except Exception:
-        return False, None
-
-def tcp_connect(ip: str, port: int, timeout: float = 0.6) -> Optional[socket.socket]:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout)
-    try:
-        s.connect((ip, port))
-        return s
-    except Exception:
-        s.close()
-        return None
-
-def banner_grab(sock: socket.socket, ip: str, port: int, timeout: float = 0.6) -> Optional[str]:
-    try:
-        sock.settimeout(timeout)
-        # Basic heuristics
-        if port in (80, 8080, 8000, 8888):
-            sock.sendall(b"HEAD / HTTP/1.0\r\nHost: %b\r\n\r\n" % ip.encode())
-            data = sock.recv(512)
-            return data.decode(errors="ignore")[:500]
-        if port in (443, 8443):
-            try:
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                with ctx.wrap_socket(sock, server_hostname=ip) as tls:
-                    tls.sendall(b"HEAD / HTTP/1.0\r\nHost: %b\r\n\r\n" % ip.encode())
-                    data = tls.recv(512)
-                    return data.decode(errors="ignore")[:500]
-            except Exception:
-                return None
-        # Generic: try to read something
-        try:
-            data = sock.recv(256)
-            if data:
-                return data.decode(errors="ignore")[:250]
-        except Exception:
-            pass
-        # Try an empty line to prompt banner
-        try:
-            sock.sendall(b"\r\n")
-            data = sock.recv(256)
-            if data:
-                return data.decode(errors="ignore")[:250]
-        except Exception:
-            pass
-        return None
+        return await asyncio.wait_for(asyncio.to_thread(socket.gethostbyaddr, ip), timeout)
     except Exception:
         return None
 
-def scan_host(ip: str, ports: List[int], tcp_timeout: float) -> List[PortResult]:
-    results: List[PortResult] = []
-    for p in ports:
-        sock = tcp_connect(ip, p, timeout=tcp_timeout)
-        if sock:
-            try:
-                banner = banner_grab(sock, ip, p, timeout=tcp_timeout) or None
-            finally:
-                try: sock.close()
-                except Exception: pass
-            results.append(PortResult(
-                port=p, state="open",
-                service_guess=SERVICE_MAP.get(p, "unknown"),
-                banner=banner
-            ))
+async def _banner_read(reader: asyncio.StreamReader, nbytes: int, timeout: float) -> str:
+    try:
+        data = await asyncio.wait_for(reader.read(nbytes), timeout=timeout)
+        return data.decode("latin-1", errors="replace").strip()
+    except Exception:
+        return ""
+
+async def _probe_http(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, host: str, timeout: float) -> str:
+    try:
+        req = f"HEAD / HTTP/1.0\r\nHost: {host}\r\nUser-Agent: lan-audit/0.1\r\nConnection: close\r\n\r\n"
+        writer.write(req.encode("ascii", errors="ignore"))
+        await writer.drain()
+        banner = await _banner_read(reader, 2048, timeout)
+        return banner
+    except Exception:
+        return ""
+
+async def _scan_port(ip: str, port: int, connect_timeout: float, read_timeout: float) -> Dict:
+    ssl_flag = port in HTTPS_PORTS
+    status = "unknown"
+    banner = ""
+    service = SERVICE_GUESSES.get(port)
+
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port, ssl=ssl_flag if ssl_flag else None),
+            timeout=connect_timeout,
+        )
+        status = "open"
+        if port in HTTP_PORTS or port in HTTPS_PORTS:
+            banner = await _probe_http(reader, writer, ip, read_timeout)
+        elif port in (21, 22, 23, 25, 110, 143):
+            banner = await _banner_read(reader, 512, read_timeout)
         else:
-            # record only open ports to keep report tight
+            # Try a tiny read; many services greet first (e.g., SSH/FTP/SMTP). If nothing, it's fine.
+            banner = await _banner_read(reader, 256, 0.2)
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
             pass
-    return results
+    except (asyncio.TimeoutError, ssl.SSLError):
+        status = "filtered"
+    except (ConnectionRefusedError, OSError):
+        # Connection refused => host alive, port closed.
+        status = "closed"
 
-def scan(target: str,
-         ports: List[int] | None = None,
-         workers: int = 100,
-         ping_timeout_ms: int = 1000,
-         tcp_timeout: float = 0.6,
-         skip_ping: bool = False) -> List[HostResult]:
-    ports = ports or COMMON_PORTS
-    hosts = iter_hosts(target)
-    out: List[HostResult] = []
+    return {
+        "port": port,
+        "service_guess": service,
+        "status": status,
+        "banner": banner[:4096] if banner else "",
+    }
 
-    # First pass: ping (optionally)
-    alive_map: Dict[str, Tuple[bool, Optional[int]]] = {}
-    if skip_ping:
-        for ip in hosts:
-            alive_map[ip] = (True, None)  # optimistic
-    else:
-        with ThreadPoolExecutor(max_workers=min(workers, 256)) as ex:
-            futs = {ex.submit(ping_host, ip, ping_timeout_ms): ip for ip in hosts}
-            for fut in as_completed(futs):
-                ip = futs[fut]
-                alive, ttl = fut.result()
-                alive_map[ip] = (alive, ttl)
+async def _scan_host(ip: str, ports: List[int], sem: asyncio.Semaphore,
+                     connect_timeout: float, read_timeout: float) -> Dict:
+    openish = False
+    results = []
+    # Limit per-host parallelism to avoid overwhelming small devices
+    per_host = min(64, max(4, len(ports)))
+    host_sem = asyncio.Semaphore(per_host)
 
-    # Second: port scans for alive hosts
-    tasks = []
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        for ip, (alive, ttl) in alive_map.items():
-            if not alive:
-                out.append(HostResult(ip=ip, alive=False, ttl=ttl,
-                                      os_guess=os_guess_from_ttl(ttl), ports=[]))
-                continue
-            tasks.append((ip, ttl, ex.submit(scan_host, ip, ports, tcp_timeout)))
+    async def _task(p: int):
+        async with host_sem:
+            return await _scan_port(ip, p, connect_timeout, read_timeout)
 
-        for ip, ttl, fut in tasks:
-            port_results = fut.result()
-            out.append(HostResult(ip=ip, alive=True, ttl=ttl,
-                                  os_guess=os_guess_from_ttl(ttl), ports=port_results))
-    # Keep stable order
-    out.sort(key=lambda h: tuple(int(o) for o in h.ip.split(".")))
-    return out
+    async with sem:
+        tasks = [asyncio.create_task(_task(p)) for p in ports]
+        port_results = await asyncio.gather(*tasks)
+        for pr in port_results:
+            results.append(pr)
+            if pr["status"] in ("open", "closed"):
+                openish = True
+
+    return {
+        "ip": ip,
+        "alive_likely": openish,
+        "ports": sorted(results, key=lambda x: x["port"]),
+    }
+
+async def scan_networks(nets: List[ipaddress.IPv4Network],
+                        ports: List[int],
+                        concurrency: int = 512,
+                        connect_timeout: float = 1.0,
+                        read_timeout: float = 0.8,
+                        resolve_hostnames: bool = True) -> Dict:
+    sem = asyncio.Semaphore(concurrency)
+    hosts = []
+    for net in nets:
+        for h in net.hosts():
+            hosts.append(str(h))
+
+    # Scan all hosts
+    tasks = [asyncio.create_task(_scan_host(ip, ports, sem, connect_timeout, read_timeout))
+             for ip in hosts]
+
+    host_results = await asyncio.gather(*tasks)
+
+    # Optional reverse DNS (keep it lightweight)
+    if resolve_hostnames:
+        async def _rdns(entry):
+            ip = entry["ip"]
+            name = None
+            r = await _reverse_dns(ip, timeout=0.5)
+            if isinstance(r, tuple) and r:
+                name = r[0]
+            entry["hostname"] = name
+            return entry
+
+        rdns_tasks = [asyncio.create_task(_rdns(e)) for e in host_results]
+        host_results = await asyncio.gather(*rdns_tasks)
+
+    # Build summary
+    summary = {
+        "total_hosts": len(hosts),
+        "scanned_ports": ports,
+        "open_counts": sum(1 for e in host_results for p in e["ports"] if p["status"] == "open"),
+        "closed_counts": sum(1 for e in host_results for p in e["ports"] if p["status"] == "closed"),
+        "filtered_counts": sum(1 for e in host_results for p in e["ports"] if p["status"] == "filtered"),
+        "alive_hosts": sum(1 for e in host_results if e["alive_likely"]),
+    }
+
+    return {
+        "hosts": host_results,
+        "summary": summary,
+    }
